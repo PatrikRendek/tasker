@@ -3,7 +3,7 @@ import hashlib
 from typing import List, Dict, Any
 import os
 from django.conf import settings
-from decimal import Decimal, ROUND_HALF_UP
+from decimal import Decimal, ROUND_HALF_UP, InvalidOperation
 
 VAT_MULTIPLIER = Decimal('1.21')
 
@@ -36,18 +36,16 @@ def transform_product(raw_product: dict) -> dict:
     
     # Handle missing or invalid prices
     if price_vat_excl is None or not isinstance(price_vat_excl, (int, float, Decimal, str)):
-        price_vat_incl = 0.0 # Or potentially None if we want to skip it later
+        price_vat_incl = 0.0 
     else:
         try:
-            # Convert to Decimal for precise financial calculation
             price_dec = Decimal(str(price_vat_excl))
             if price_dec < 0:
                 price_vat_incl = 0.0
             else:
-                # Calculate, round to 2 decimal places using standard Half-Up rounding, and convert back to float
                 calc_val = (price_dec * VAT_MULTIPLIER).quantize(Decimal('0.01'), rounding=ROUND_HALF_UP)
                 price_vat_incl = float(calc_val)
-        except (ValueError, TypeError, float.InvalidOperation):
+        except (ValueError, TypeError, InvalidOperation):
             price_vat_incl = 0.0
             
     # 2. Stock aggregation

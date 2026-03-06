@@ -93,7 +93,7 @@ def sync_erp_to_eshop(self):
     return result_msg
 
 
-def send_to_eshop_api(sku: str, data: dict, is_new: bool, task_instance=None) -> bool:
+def send_to_eshop_api(sku: str, data: dict, is_new: bool, task_instance=None, _sync_retries_left: int = 3) -> bool:
     """
     Sends a single product to the e-shop API. Handles rate limiting and retries on 429.
     Returns True if successful, False otherwise.
@@ -126,11 +126,14 @@ def send_to_eshop_api(sku: str, data: dict, is_new: bool, task_instance=None) ->
                 # Exponential backoff e.g. 2s, 4s, 8s...
                 retry_countdown = 2 ** task_instance.request.retries
                 raise task_instance.retry(exc=Exception("429 Too Many Requests"), countdown=retry_countdown)
-            else:
-                # Fallback purely synchronous retry if run without Celery context
+            elif _sync_retries_left > 0:
+                # Fallback synchronous retry with bounded recursion depth
                 time.sleep(2)
-                logger.info(f"Retrying synchronously for {sku}...")
-                return send_to_eshop_api(sku, data, is_new, task_instance=None)
+                logger.info(f"Retrying synchronously for {sku} ({_sync_retries_left} retries left)...")
+                return send_to_eshop_api(sku, data, is_new, task_instance=None, _sync_retries_left=_sync_retries_left - 1)
+            else:
+                logger.error(f"Max synchronous retries exhausted for {sku}.")
+                return False
                 
         else:
             logger.error(f"Failed to sync {sku}. API responded with {response.status_code}: {response.text}")

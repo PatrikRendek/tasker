@@ -3,7 +3,9 @@ from unittest.mock import patch, MagicMock
 from integrator.logic import transform_product, calculate_hash
 from integrator.models import ProductSyncState
 from integrator.tasks import sync_erp_to_eshop, send_to_eshop_api
+from integrator.logic import ESHOP_API_BASE_URL, ESHOP_API_KEY
 import json
+import responses
 
 class TransformationTests(TestCase):
     def test_transform_product_normal(self):
@@ -38,6 +40,29 @@ class TransformationTests(TestCase):
         }
         res = transform_product(raw)
         self.assertEqual(res['price_vat_incl'], 0.0)
+
+
+class HashTests(TestCase):
+    """Tests for the calculate_hash utility function."""
+    
+    def test_hash_consistency(self):
+        """Same input should always produce the same hash."""
+        data = {"sku": "SKU-1", "price_vat_incl": 1210.0, "total_stock": 15}
+        hash1 = calculate_hash(data)
+        hash2 = calculate_hash(data)
+        self.assertEqual(hash1, hash2)
+    
+    def test_hash_key_order_independence(self):
+        """Hash should be the same regardless of key insertion order."""
+        data_a = {"sku": "SKU-1", "price_vat_incl": 1210.0}
+        data_b = {"price_vat_incl": 1210.0, "sku": "SKU-1"}
+        self.assertEqual(calculate_hash(data_a), calculate_hash(data_b))
+    
+    def test_hash_detects_change(self):
+        """Different data should produce a different hash."""
+        data_a = {"sku": "SKU-1", "price_vat_incl": 1210.0}
+        data_b = {"sku": "SKU-1", "price_vat_incl": 1211.0}
+        self.assertNotEqual(calculate_hash(data_a), calculate_hash(data_b))
 
 
 class SyncTaskTests(TestCase):
@@ -149,3 +174,67 @@ class ApiCallTests(TestCase):
         self.assertEqual(str(context.exception), "RetryTriggered")
         mock_patch.assert_called_once()
         mock_task.retry.assert_called_once()
+
+
+class ResponsesApiTests(TestCase):
+    """
+    Tests using the `responses` library to mock the e-shop API at the HTTP level.
+    This provides more realistic integration-like testing than unittest.mock alone.
+    """
+
+    @responses.activate
+    @patch('integrator.tasks.time.sleep')
+    def test_post_new_product_via_responses(self, mock_sleep):
+        """Test creating a new product via POST using responses mock."""
+        responses.add(
+            responses.POST,
+            f"{ESHOP_API_BASE_URL}/products/",
+            json={"status": "created"},
+            status=201
+        )
+        
+        result = send_to_eshop_api("SKU-NEW", {"title": "Test"}, is_new=True)
+        
+        self.assertTrue(result)
+        self.assertEqual(len(responses.calls), 1)
+        self.assertEqual(responses.calls[0].request.headers['X-Api-Key'], ESHOP_API_KEY)
+
+    @responses.activate
+    @patch('integrator.tasks.time.sleep')
+    def test_patch_existing_product_via_responses(self, mock_sleep):
+        """Test updating an existing product via PATCH using responses mock."""
+        responses.add(
+            responses.PATCH,
+            f"{ESHOP_API_BASE_URL}/products/SKU-UPD/",
+            json={"status": "updated"},
+            status=200
+        )
+        
+        result = send_to_eshop_api("SKU-UPD", {"title": "Updated"}, is_new=False)
+        
+        self.assertTrue(result)
+        self.assertEqual(len(responses.calls), 1)
+        self.assertIn("SKU-UPD", responses.calls[0].request.url)
+
+    @responses.activate
+    @patch('integrator.tasks.time.sleep')
+    def test_429_rate_limit_sync_retry_via_responses(self, mock_sleep):
+        """Test that 429 triggers sync retries and eventually succeeds."""
+        responses.add(
+            responses.POST,
+            f"{ESHOP_API_BASE_URL}/products/",
+            json={"error": "too many requests"},
+            status=429
+        )
+        responses.add(
+            responses.POST,
+            f"{ESHOP_API_BASE_URL}/products/",
+            json={"status": "created"},
+            status=201
+        )
+        
+        result = send_to_eshop_api("SKU-RETRY", {"title": "Retry"}, is_new=True)
+        
+        self.assertTrue(result)
+        self.assertEqual(len(responses.calls), 2)  # 429 + 201
+
