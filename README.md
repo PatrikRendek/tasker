@@ -1,12 +1,12 @@
 # Symmy Tasker: E-Shop Integrator
 
-A robust synchronization microservice (bridge) between a simulated ERP system (local JSON repository) and a fictitious e-shop API, built using Django, Celery asynchronous tasks, Redis, and a PostgreSQL database.
+A synchronization microservice (bridge) between a simulated ERP system (local JSON repository) and a fictitious e-shop API, built using Django, Celery asynchronous tasks, Redis, and a PostgreSQL database.
 
 ## Key Features
 - **Delta Sync + Redis Cache**: Only products that have undergone any change are sent to the external e-shop API. This is determined using SHA-256 hashes of the JSON transformations. Hashes are stored and checked against a fast **Redis internal cache** first to avoid thousands of unnecessary PostgreSQL queries, defaulting to DB locks only when changes are detected.
-- **Asynchrony and Stability**: The process is delegated to the background (Celery worker), which does not block other parts of the application. The rate limit of 5 requests/s per e-shop API call is fully supported.
+- **Asynchrony and Stability**: The process is delegated to the background (Celery worker), which does not block other parts of the application. The rate limit of 5 requests/s per e-shop API call is enforced via a synchronous delay between requests, which is sufficient for serial processing within a single worker. For distributed multi-worker setups, this could be upgraded to a shared Token Bucket pattern backed by Redis.
 - **Auto-Retries (HTTP 429)**: When the API returns "Too Many Requests", the Celery task schedules a retry utilizing "Exponential Backoff", ensuring delivery after the stream slows down.
-- **Data Processing and Business Rules**: Automatic summation of stocks across multiple warehouses, exact calculation of the final price (+21% VAT), and fallback logic for missing attributes (`color: "N/A"`).
+- **Data Processing and Business Rules**: Automatic summation of stocks across multiple warehouses, exact calculation of the final price (+21% VAT) using `Decimal` precision to prevent floating-point rounding errors, and fallback logic for missing attributes (`color: "N/A"`).
 
 ## Architecture and Dependencies
 - **Django**: The main application framework and mapping of the model to the database to maintain the synchronization state (`ProductSyncState`).
@@ -49,7 +49,7 @@ docker-compose logs -f worker
 ---
 
 ## 🛡️ Testing
-Unit and integration test coverage is applied, utilizing mocking techniques for external HTTP calls. This ensures off-grid stability of transformation processes, Rate Limit retry logic, and prevention of unnecessary network requests (Delta Sync).
+Unit and integration test coverage is applied, utilizing both `unittest.mock` and the `responses` library for HTTP-level mocking of external API calls. This ensures off-grid stability of transformation processes, Rate Limit retry logic, and prevention of unnecessary network requests (Delta Sync).
 
 To run locally inside the Docker container:
 ```bash
