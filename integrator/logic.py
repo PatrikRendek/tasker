@@ -3,6 +3,9 @@ import hashlib
 from typing import List, Dict, Any
 import os
 from django.conf import settings
+from decimal import Decimal, ROUND_HALF_UP
+
+VAT_MULTIPLIER = Decimal('1.21')
 
 # Rate limits settings for future API calls
 ESHOP_API_BASE_URL = "https://api.fake-eshop.cz/v1"
@@ -32,11 +35,21 @@ def transform_product(raw_product: dict) -> dict:
     price_vat_excl = raw_product.get('price_vat_excl')
     
     # Handle missing or invalid prices
-    if price_vat_excl is None or not isinstance(price_vat_excl, (int, float)) or price_vat_excl < 0:
+    if price_vat_excl is None or not isinstance(price_vat_excl, (int, float, Decimal, str)):
         price_vat_incl = 0.0 # Or potentially None if we want to skip it later
     else:
-        price_vat_incl = round(price_vat_excl * 1.21, 2)
-        
+        try:
+            # Convert to Decimal for precise financial calculation
+            price_dec = Decimal(str(price_vat_excl))
+            if price_dec < 0:
+                price_vat_incl = 0.0
+            else:
+                # Calculate, round to 2 decimal places using standard Half-Up rounding, and convert back to float
+                calc_val = (price_dec * VAT_MULTIPLIER).quantize(Decimal('0.01'), rounding=ROUND_HALF_UP)
+                price_vat_incl = float(calc_val)
+        except (ValueError, TypeError, float.InvalidOperation):
+            price_vat_incl = 0.0
+            
     # 2. Stock aggregation
     stocks = raw_product.get('stocks', {})
     total_stock = 0
