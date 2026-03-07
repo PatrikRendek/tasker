@@ -1,4 +1,5 @@
 from celery import shared_task
+from celery.exceptions import Retry as CeleryRetry
 import requests
 import time
 import logging
@@ -84,6 +85,8 @@ def sync_erp_to_eshop(self):
                 else:
                     failed_count += 1
                     
+        except CeleryRetry:
+            raise  # Let Celery handle the retry, do not swallow it
         except Exception as e:
             logger.error(f"Error processing product {raw_product.get('id', 'UNKNOWN')}: {e}")
             failed_count += 1
@@ -127,9 +130,10 @@ def send_to_eshop_api(sku: str, data: dict, is_new: bool, task_instance=None, _s
                 retry_countdown = 2 ** task_instance.request.retries
                 raise task_instance.retry(exc=Exception("429 Too Many Requests"), countdown=retry_countdown)
             elif _sync_retries_left > 0:
-                # Fallback synchronous retry with bounded recursion depth
-                time.sleep(2)
-                logger.info(f"Retrying synchronously for {sku} ({_sync_retries_left} retries left)...")
+                # Fallback synchronous retry with exponential backoff
+                retry_wait = 2 ** (4 - _sync_retries_left)  # 2s, 4s, 8s
+                time.sleep(retry_wait)
+                logger.info(f"Retrying synchronously for {sku} in {retry_wait}s ({_sync_retries_left} retries left)...")
                 return send_to_eshop_api(sku, data, is_new, task_instance=None, _sync_retries_left=_sync_retries_left - 1)
             else:
                 logger.error(f"Max synchronous retries exhausted for {sku}.")
@@ -141,5 +145,5 @@ def send_to_eshop_api(sku: str, data: dict, is_new: bool, task_instance=None, _s
             
     except requests.exceptions.RequestException as e:
         logger.error(f"Network error syncing {sku}: {e}")
-        # Could also trigger a celery retry here if desired
+
         return False
