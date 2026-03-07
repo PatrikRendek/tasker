@@ -1,5 +1,6 @@
 from django.test import TestCase
 from unittest.mock import patch, MagicMock
+from celery.exceptions import Retry as CeleryRetry
 from integrator.logic import transform_product, calculate_hash
 from integrator.models import ProductSyncState
 from integrator.tasks import sync_erp_to_eshop, send_to_eshop_api
@@ -160,18 +161,17 @@ class ApiCallTests(TestCase):
         # Fake task instance to test retry exception throwing
         mock_task = MagicMock()
         mock_task.request.retries = 1
-        mock_task.retry = MagicMock(side_effect=Exception("RetryTriggered"))
+        mock_task.retry = MagicMock(side_effect=CeleryRetry("RetryTriggered"))
         
         # Fake 429 response
         mock_resp = MagicMock()
         mock_resp.status_code = 429
         mock_patch.return_value = mock_resp
         
-        # Act & Assert
-        with self.assertRaises(Exception) as context:
+        # Act & Assert: Must raise CeleryRetry, not get swallowed
+        with self.assertRaises(CeleryRetry):
             send_to_eshop_api("SKU-Y", {"k": "v"}, is_new=False, task_instance=mock_task)
-            
-        self.assertEqual(str(context.exception), "RetryTriggered")
+        
         mock_patch.assert_called_once()
         mock_task.retry.assert_called_once()
 
@@ -238,3 +238,105 @@ class ResponsesApiTests(TestCase):
         self.assertTrue(result)
         self.assertEqual(len(responses.calls), 2)  # 429 + 201
 
+
+class RateLimitRetryTests(TestCase):
+    """
+    Tests specifically verifying the rate limiting retry behavior:
+    - CeleryRetry propagation through the outer except block
+    - Exponential backoff in synchronous fallback retries
+    - Retry exhaustion returns False
+    """
+
+    @patch('integrator.tasks.send_to_eshop_api')
+    @patch('integrator.tasks.cache')
+    @patch('integrator.tasks.load_erp_data')
+    def test_celery_retry_propagates_through_outer_except(self, mock_load, mock_cache, mock_send):
+        """
+        When send_to_eshop_api raises CeleryRetry (via task_instance.retry()),
+        the outer except block in sync_erp_to_eshop must NOT swallow it.
+        The CeleryRetry exception must propagate out so Celery can reschedule.
+        """
+        mock_load.return_value = [{
+            "id": "SKU-RETRY-PROP",
+            "title": "Test",
+            "price_vat_excl": 100,
+            "stocks": {"a": 1},
+            "attributes": {}
+        }]
+        mock_cache.get.return_value = None  # Force cache miss
+        mock_send.side_effect = CeleryRetry("429 retry")
+
+        # CeleryRetry must propagate, NOT be caught by except Exception
+        with self.assertRaises(CeleryRetry):
+            sync_erp_to_eshop()
+
+    @patch('integrator.tasks.requests.post')
+    @patch('integrator.tasks.time.sleep')
+    def test_sync_retry_uses_exponential_backoff(self, mock_sleep, mock_post):
+        """
+        Synchronous fallback retry should use exponential backoff:
+        retry 3 left -> sleep(2), retry 2 left -> sleep(4), retry 1 left -> sleep(8).
+        After 3 retries (all 429), 4th attempt succeeds with 201.
+        """
+        mock_responses = []
+        for _ in range(3):
+            r = MagicMock()
+            r.status_code = 429
+            mock_responses.append(r)
+        success_resp = MagicMock()
+        success_resp.status_code = 201
+        mock_responses.append(success_resp)
+        mock_post.side_effect = mock_responses
+
+        result = send_to_eshop_api("SKU-EXP", {"title": "Test"}, is_new=True, task_instance=None, _sync_retries_left=3)
+
+        self.assertTrue(result)
+        self.assertEqual(mock_post.call_count, 4)  # 3 x 429 + 1 x 201
+
+        # Verify exponential backoff sleep values
+        sleep_values = [c[0][0] for c in mock_sleep.call_args_list]
+        retry_sleeps = [v for v in sleep_values if v > 0.2]
+        self.assertEqual(retry_sleeps, [2, 4, 8],
+                         f"Expected exponential backoff [2, 4, 8], got {retry_sleeps}")
+
+    @patch('integrator.tasks.requests.post')
+    @patch('integrator.tasks.time.sleep')
+    def test_sync_retry_exhaustion_returns_false(self, mock_sleep, mock_post):
+        """
+        When all synchronous retries are exhausted (all return 429),
+        the function must return False.
+        """
+        mock_resp = MagicMock()
+        mock_resp.status_code = 429
+        mock_post.return_value = mock_resp
+
+        result = send_to_eshop_api("SKU-EXHAUST", {"title": "Test"}, is_new=True, task_instance=None, _sync_retries_left=3)
+
+        self.assertFalse(result)
+        # 1 initial + 3 retries = 4 total calls
+        self.assertEqual(mock_post.call_count, 4)
+
+    @responses.activate
+    @patch('integrator.tasks.time.sleep')
+    def test_429_then_success_via_responses_library(self, mock_sleep):
+        """
+        Integration-style test using responses library:
+        First request returns 429, second returns 201. Verifies end-to-end retry.
+        """
+        responses.add(
+            responses.POST,
+            f"{ESHOP_API_BASE_URL}/products/",
+            json={"error": "rate limited"},
+            status=429
+        )
+        responses.add(
+            responses.POST,
+            f"{ESHOP_API_BASE_URL}/products/",
+            json={"status": "created"},
+            status=201
+        )
+
+        result = send_to_eshop_api("SKU-RL", {"title": "Rate Limited"}, is_new=True, task_instance=None)
+
+        self.assertTrue(result)
+        self.assertEqual(len(responses.calls), 2)  # 429 + 201
